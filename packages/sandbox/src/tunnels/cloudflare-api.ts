@@ -33,6 +33,22 @@ interface BaseArgs {
 }
 
 /**
+ * Credentials bundle used by the account- and zone-scoped helpers
+ * (`listSandboxTunnels`, `listSandboxDNSRecords`, and the orchestration
+ * in `sweep.ts`). Tunnel-only helpers leave `zoneId` undefined; DNS
+ * helpers require it and throw when it is missing.
+ *
+ * Kept separate from the per-function arg shapes so the reconciler can
+ * thread one value through every CF call without rebuilding the bag.
+ */
+export interface CloudflareCredentials {
+  token: string;
+  accountId: string;
+  zoneId?: string;
+  fetcher?: Fetcher;
+}
+
+/**
  * Tag attached to every tunnel resource the SDK creates. Survives
  * round-tripping through the Cloudflare API so `findTunnelByName` can
  * reconcile orphaned resources from a previous failed attempt.
@@ -493,4 +509,299 @@ export async function deleteDNSRecord(
       acceptStatuses: [404]
     }
   );
+}
+
+// ---------------------------------------------------------------------------
+// Reconciler / sweep helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Cloudflare list endpoints (`/cfd_tunnel`, `/dns_records`) return a
+ * `result_info` block alongside `result`. `cfRequest` discards
+ * `result_info` because the named-tunnel paths only ever fetch single
+ * pages. The sweep helpers below page through the full account/zone, so
+ * they read `result_info` directly via `cfRequestPaginated`.
+ */
+interface ResultInfo {
+  page: number;
+  per_page: number;
+  total_pages: number;
+  count?: number;
+  total_count?: number;
+}
+
+/**
+ * Cloudflare's paginated list endpoints respond with one of two
+ * shapes. On success the envelope carries `result` and `result_info`;
+ * on failure it carries `errors` (and HTTP status is non-2xx). The
+ * union forces callers to discriminate on `success` before reaching
+ * for `result`, so a malformed-but-2xx response can't slip through as
+ * an empty page.
+ */
+type PaginatedResponse<T> =
+  | {
+      success: true;
+      result: T[];
+      result_info?: ResultInfo;
+    }
+  | {
+      success: false;
+      errors?: Array<{ code?: number; message?: string }>;
+    };
+
+/**
+ * Walk a Cloudflare list endpoint until every page has been read.
+ *
+ * `urlBuilder` is invoked per page with the 1-indexed page number and is
+ * expected to return the full URL including any caller-provided query
+ * parameters. The helper appends `page` and `per_page` itself so the
+ * pagination contract stays in one place.
+ *
+ * The loop terminates as soon as `result_info.total_pages` is reached;
+ * a missing `result_info` (e.g. an endpoint that returned a single
+ * page without metadata) is treated as the only page, which keeps the
+ * helper safe against the API returning the legacy non-paginated shape
+ * by accident.
+ */
+const PAGE_SIZE = 1000;
+
+/**
+ * Single-page request that returns the full `PaginatedResponse<T>`
+ * envelope so the pagination loop can inspect `result_info`. Named
+ * `Paginated` (vs the full-walk helper below) because it participates
+ * in pagination but only fetches one page — the loop owns the cursor.
+ *
+ * `cfRequest` deliberately discards `result_info` for non-paginated
+ * callers; this is the parallel path for the list helpers.
+ */
+async function cfPaginatedRequest<T>(
+  url: string,
+  token: string,
+  fetcher: Fetcher
+): Promise<Extract<PaginatedResponse<T>, { success: true }>> {
+  const init: RequestInit = {
+    method: 'GET',
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json'
+    },
+    signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS)
+  };
+  let response: Response;
+  try {
+    response = await fetcher(url, init);
+  } catch (err) {
+    if (err instanceof Error && err.name === 'TimeoutError') {
+      throw new Error(
+        `Cloudflare API request to ${url} timed out after ${DEFAULT_TIMEOUT_MS}ms`
+      );
+    }
+    throw err;
+  }
+  let envelope: PaginatedResponse<T>;
+  try {
+    envelope = (await response.json()) as PaginatedResponse<T>;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Cloudflare API returned non-JSON response (status ${response.status}): ${message}`
+    );
+  }
+  if (!response.ok || envelope.success === false) {
+    const errs = envelope.success === false ? (envelope.errors ?? []) : [];
+    const summary = errs.length
+      ? errs
+          .map((e) => `${e.code ?? '???'}: ${e.message ?? 'unknown'}`)
+          .join(', ')
+      : `HTTP ${response.status}`;
+    throw new Error(`Cloudflare API error: ${summary}`);
+  }
+  // envelope.success is necessarily `true` here — the `!ok || success ===
+  // false` branch above throws. TS's control-flow narrowing through the
+  // explicit-false check picks that up.
+  return envelope as Extract<PaginatedResponse<T>, { success: true }>;
+}
+
+/**
+ * Walk a Cloudflare list endpoint until every page has been read,
+ * collecting `result` arrays into a single flat array.
+ *
+ * `urlBuilder` is invoked per page with the 1-indexed page number; it
+ * is expected to return the full URL including any caller-provided
+ * query parameters. The helper owns `page` and `per_page` so the
+ * pagination contract stays in one place.
+ *
+ * The loop terminates as soon as `result_info.total_pages` is reached;
+ * a missing `result_info` (e.g. an endpoint that returned a single
+ * page without metadata) is treated as the only page, which keeps the
+ * helper safe against the API returning the legacy non-paginated shape
+ * by accident.
+ */
+async function cfFullyPaginatedRequest<T>(
+  urlBuilder: (page: number, perPage: number) => string,
+  token: string,
+  fetcher: Fetcher
+): Promise<T[]> {
+  const collected: T[] = [];
+  let page = 1;
+  for (;;) {
+    const response = await cfPaginatedRequest<T>(
+      urlBuilder(page, PAGE_SIZE),
+      token,
+      fetcher
+    );
+    for (const item of response.result) collected.push(item);
+    const totalPages = response.result_info?.total_pages ?? 1;
+    if (page >= totalPages) return collected;
+    page += 1;
+  }
+}
+
+/**
+ * Summary of a tunnel returned by `listSandboxTunnels`. ISO timestamps
+ * are parsed into `Date` so callers don't have to repeat the same
+ * conversion for every staleness check.
+ *
+ * `metadata` stays raw (`Record<string, unknown>`) because the sweep
+ * has to defend against tunnels created by another tool that happened
+ * to set `createdBy: 'sandbox-sdk'` without our identifying fields. The
+ * caller inspects `metadata.sandboxId` itself before deciding to delete.
+ */
+export interface TunnelSummary {
+  id: string;
+  name: string;
+  status: 'healthy' | 'down' | 'degraded' | 'inactive';
+  createdAt: Date;
+  connsActiveAt: Date | null;
+  connsInactiveAt: Date | null;
+  deletedAt: Date | null;
+  metadata: Record<string, unknown> | null;
+}
+
+/**
+ * Summary of a DNS record returned by `listSandboxDNSRecords`. Filtered
+ * to records whose `comment` matches `^sandbox-`, which is the marker
+ * `upsertCNAME` writes when provisioning a named tunnel.
+ */
+export interface DNSSummary {
+  id: string;
+  name: string;
+  type: string;
+  content: string;
+  comment: string | null;
+  createdAt: Date;
+}
+
+interface ListTunnelsRaw {
+  id: string;
+  name: string;
+  status?: string;
+  created_at?: string;
+  conns_active_at?: string | null;
+  conns_inactive_at?: string | null;
+  deleted_at?: string | null;
+  metadata?: Record<string, unknown> | null;
+}
+
+interface ListDNSRaw {
+  id: string;
+  name: string;
+  type: string;
+  content: string;
+  comment?: string | null;
+  created_on?: string;
+}
+
+function parseDate(value: string | null | undefined): Date | null {
+  if (!value) return null;
+  return new Date(value);
+}
+
+/**
+ * List every Cloudflare tunnel in the account that was tagged by this
+ * SDK (`metadata.createdBy === 'sandbox-sdk'`).
+ *
+ * The Cloudflare API does not index custom metadata, so the SDK pulls
+ * every non-deleted tunnel and filters client-side. `per_page=1000` is
+ * the documented maximum.
+ *
+ * `opts.sandboxId` narrows the result to a single sandbox's tunnels
+ * — useful for callers building per-sandbox dashboards on top of the
+ * sweep primitives.
+ */
+export async function listSandboxTunnels(
+  creds: CloudflareCredentials,
+  opts: { sandboxId?: string; fetcher?: Fetcher } = {}
+): Promise<TunnelSummary[]> {
+  const fetcher = opts.fetcher ?? creds.fetcher ?? fetch;
+  const base = `${API_BASE}/accounts/${encodeURIComponent(creds.accountId)}/cfd_tunnel`;
+  const raw = await cfFullyPaginatedRequest<ListTunnelsRaw>(
+    (page, perPage) =>
+      `${base}?is_deleted=false&page=${page}&per_page=${perPage}`,
+    creds.token,
+    fetcher
+  );
+  return raw
+    .filter((t) => {
+      const meta = t.metadata ?? null;
+      if (!meta || meta.createdBy !== 'sandbox-sdk') return false;
+      if (opts.sandboxId !== undefined && meta.sandboxId !== opts.sandboxId) {
+        return false;
+      }
+      return true;
+    })
+    .map((t) => ({
+      id: t.id,
+      name: t.name,
+      status: (t.status ?? 'inactive') as TunnelSummary['status'],
+      createdAt: parseDate(t.created_at) ?? new Date(0),
+      connsActiveAt: parseDate(t.conns_active_at ?? null),
+      connsInactiveAt: parseDate(t.conns_inactive_at ?? null),
+      deletedAt: parseDate(t.deleted_at ?? null),
+      metadata: t.metadata ?? null
+    }));
+}
+
+/**
+ * List every CNAME in the configured zone whose `comment` starts with
+ * `sandbox-`, the marker `upsertCNAME` writes when provisioning a named
+ * tunnel.
+ *
+ * Cloudflare's `/dns_records` endpoint supports `comment.startswith`,
+ * which scopes the response server-side; the SDK relies on that to
+ * keep response sizes small in zones that host non-sandbox records.
+ *
+ * Requires `creds.zoneId` — throws when omitted so callers don't
+ * silently fall back to listing every CNAME in the account.
+ */
+export async function listSandboxDNSRecords(
+  creds: CloudflareCredentials,
+  opts: { sandboxId?: string; fetcher?: Fetcher } = {}
+): Promise<DNSSummary[]> {
+  if (!creds.zoneId) {
+    throw new Error(
+      'listSandboxDNSRecords requires creds.zoneId. Pass it on CloudflareCredentials.'
+    );
+  }
+  const fetcher = opts.fetcher ?? creds.fetcher ?? fetch;
+  const base = `${API_BASE}/zones/${encodeURIComponent(creds.zoneId)}/dns_records`;
+  const query = 'type=CNAME&comment.startswith=sandbox-';
+  const raw = await cfFullyPaginatedRequest<ListDNSRaw>(
+    (page, perPage) => `${base}?${query}&page=${page}&per_page=${perPage}`,
+    creds.token,
+    fetcher
+  );
+  return raw
+    .filter((r) => {
+      if (opts.sandboxId === undefined) return true;
+      return r.comment === `sandbox-${opts.sandboxId}`;
+    })
+    .map((r) => ({
+      id: r.id,
+      name: r.name,
+      type: r.type,
+      content: r.content,
+      comment: r.comment ?? null,
+      createdAt: parseDate(r.created_on) ?? new Date(0)
+    }));
 }

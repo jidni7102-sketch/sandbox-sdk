@@ -31,5 +31,10 @@
       "new_sqlite_classes": ["Sandbox"],
       "tag": "v1"
     }
-  ]
+  ],
+  // Daily tunnel reconciler. Only fires when CLOUDFLARE_API_TOKEN is set;
+  // see README.md § Tunnel reconciler.
+  "triggers": {
+    "crons": ["0 3 * * *"]
+  }
 }

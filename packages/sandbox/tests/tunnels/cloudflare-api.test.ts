@@ -19,6 +19,8 @@ import {
   findTunnelByName,
   getTunnelToken,
   getZoneName,
+  listSandboxDNSRecords,
+  listSandboxTunnels,
   upsertCNAME
 } from '../../src/tunnels/cloudflare-api';
 
@@ -27,6 +29,37 @@ function jsonOK(body: unknown): Response {
     status: 200,
     headers: { 'content-type': 'application/json' }
   });
+}
+
+/**
+ * Build a paginated response shaped like Cloudflare's list endpoints:
+ * `{ success, result, result_info: { page, per_page, total_pages, count, total_count } }`.
+ * `listSandboxTunnels` and `listSandboxDNSRecords` walk this shape until
+ * `page >= total_pages`.
+ */
+function jsonPage(
+  body: unknown[],
+  page: number,
+  totalPages: number,
+  perPage = 1000
+): Response {
+  return new Response(
+    JSON.stringify({
+      success: true,
+      result: body,
+      result_info: {
+        page,
+        per_page: perPage,
+        total_pages: totalPages,
+        count: body.length,
+        total_count: body.length
+      }
+    }),
+    {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    }
+  );
 }
 
 function jsonError(body: unknown, status = 400): Response {
@@ -627,5 +660,326 @@ describe('cloudflare-api > request timeout', () => {
       fetcher: fetcher as unknown as typeof fetch
     });
     expect(observedSignal).toBeInstanceOf(AbortSignal);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// listSandboxTunnels
+// ---------------------------------------------------------------------------
+
+describe('cloudflare-api > listSandboxTunnels', () => {
+  it('GETs /accounts/:id/cfd_tunnel with is_deleted=false and per_page=1000', async () => {
+    const fetcher = vi.fn(async () => jsonPage([], 1, 1));
+    await listSandboxTunnels({ token: 'tok', accountId: 'acct' }, { fetcher });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    const [url, init] = fetcher.mock.calls[0];
+    expect(String(url)).toContain(
+      'https://api.cloudflare.com/client/v4/accounts/acct/cfd_tunnel'
+    );
+    expect(String(url)).toContain('is_deleted=false');
+    expect(String(url)).toContain('per_page=1000');
+    expect(init?.method ?? 'GET').toBe('GET');
+    const headers = new Headers(init?.headers);
+    expect(headers.get('authorization')).toBe('Bearer tok');
+  });
+
+  it('filters out tunnels whose metadata.createdBy is not sandbox-sdk', async () => {
+    const fetcher = vi.fn(async () =>
+      jsonPage(
+        [
+          {
+            id: 'ours',
+            name: 'sandbox-sb1-api',
+            status: 'healthy',
+            created_at: '2026-05-01T00:00:00Z',
+            conns_active_at: '2026-05-26T10:00:00Z',
+            conns_inactive_at: null,
+            deleted_at: null,
+            metadata: { createdBy: 'sandbox-sdk', sandboxId: 'sb1' }
+          },
+          {
+            id: 'theirs',
+            name: 'someone-elses-tunnel',
+            status: 'healthy',
+            created_at: '2026-05-01T00:00:00Z',
+            conns_active_at: null,
+            conns_inactive_at: null,
+            deleted_at: null,
+            metadata: { createdBy: 'another-tool' }
+          },
+          {
+            id: 'unlabelled',
+            name: 'mystery',
+            status: 'inactive',
+            created_at: '2026-05-01T00:00:00Z',
+            conns_active_at: null,
+            conns_inactive_at: null,
+            deleted_at: null,
+            metadata: null
+          }
+        ],
+        1,
+        1
+      )
+    );
+    const result = await listSandboxTunnels(
+      { token: 'tok', accountId: 'acct' },
+      { fetcher }
+    );
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe('ours');
+  });
+
+  it('also filters by metadata.sandboxId when opts.sandboxId is set', async () => {
+    const fetcher = vi.fn(async () =>
+      jsonPage(
+        [
+          {
+            id: 'sb1-tun',
+            name: 'sandbox-sb1-api',
+            status: 'healthy',
+            created_at: '2026-05-01T00:00:00Z',
+            conns_active_at: null,
+            conns_inactive_at: null,
+            deleted_at: null,
+            metadata: { createdBy: 'sandbox-sdk', sandboxId: 'sb1' }
+          },
+          {
+            id: 'sb2-tun',
+            name: 'sandbox-sb2-api',
+            status: 'healthy',
+            created_at: '2026-05-01T00:00:00Z',
+            conns_active_at: null,
+            conns_inactive_at: null,
+            deleted_at: null,
+            metadata: { createdBy: 'sandbox-sdk', sandboxId: 'sb2' }
+          }
+        ],
+        1,
+        1
+      )
+    );
+    const result = await listSandboxTunnels(
+      { token: 'tok', accountId: 'acct' },
+      { sandboxId: 'sb1', fetcher }
+    );
+    expect(result.map((t) => t.id)).toEqual(['sb1-tun']);
+  });
+
+  it('parses ISO timestamps into Date instances', async () => {
+    const fetcher = vi.fn(async () =>
+      jsonPage(
+        [
+          {
+            id: 'tun-1',
+            name: 'sandbox-sb-api',
+            status: 'down',
+            created_at: '2026-05-01T00:00:00Z',
+            conns_active_at: '2026-05-10T12:00:00Z',
+            conns_inactive_at: '2026-05-15T08:30:00Z',
+            deleted_at: null,
+            metadata: { createdBy: 'sandbox-sdk', sandboxId: 'sb' }
+          }
+        ],
+        1,
+        1
+      )
+    );
+    const [tunnel] = await listSandboxTunnels(
+      { token: 'tok', accountId: 'acct' },
+      { fetcher }
+    );
+    expect(tunnel.createdAt).toBeInstanceOf(Date);
+    expect(tunnel.createdAt.toISOString()).toBe('2026-05-01T00:00:00.000Z');
+    expect(tunnel.connsActiveAt).toBeInstanceOf(Date);
+    expect(tunnel.connsActiveAt?.toISOString()).toBe(
+      '2026-05-10T12:00:00.000Z'
+    );
+    expect(tunnel.connsInactiveAt).toBeInstanceOf(Date);
+    expect(tunnel.connsInactiveAt?.toISOString()).toBe(
+      '2026-05-15T08:30:00.000Z'
+    );
+    expect(tunnel.deletedAt).toBeNull();
+    expect(tunnel.status).toBe('down');
+  });
+
+  it('walks pagination until result_info.page >= total_pages', async () => {
+    let page = 0;
+    const fetcher = vi.fn(async (url) => {
+      page += 1;
+      expect(String(url)).toContain(`page=${page}`);
+      return jsonPage(
+        [
+          {
+            id: `tun-${page}`,
+            name: `sandbox-sb-${page}`,
+            status: 'healthy',
+            created_at: '2026-05-01T00:00:00Z',
+            conns_active_at: null,
+            conns_inactive_at: null,
+            deleted_at: null,
+            metadata: { createdBy: 'sandbox-sdk', sandboxId: 'sb' }
+          }
+        ],
+        page,
+        3
+      );
+    });
+    const result = await listSandboxTunnels(
+      { token: 'tok', accountId: 'acct' },
+      { fetcher }
+    );
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(result.map((t) => t.id)).toEqual(['tun-1', 'tun-2', 'tun-3']);
+  });
+
+  it('preserves metadata as a raw object so callers can read non-standard tags', async () => {
+    const fetcher = vi.fn(async () =>
+      jsonPage(
+        [
+          {
+            id: 'tun',
+            name: 'sandbox-sb-x',
+            status: 'healthy',
+            created_at: '2026-05-01T00:00:00Z',
+            conns_active_at: null,
+            conns_inactive_at: null,
+            deleted_at: null,
+            metadata: {
+              createdBy: 'sandbox-sdk',
+              sandboxId: 'sb',
+              extra: 'whatever'
+            }
+          }
+        ],
+        1,
+        1
+      )
+    );
+    const [tunnel] = await listSandboxTunnels(
+      { token: 'tok', accountId: 'acct' },
+      { fetcher }
+    );
+    expect(tunnel.metadata).toEqual({
+      createdBy: 'sandbox-sdk',
+      sandboxId: 'sb',
+      extra: 'whatever'
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// listSandboxDNSRecords
+// ---------------------------------------------------------------------------
+
+describe('cloudflare-api > listSandboxDNSRecords', () => {
+  it('GETs /zones/:id/dns_records with type=CNAME and comment.startswith=sandbox-', async () => {
+    const fetcher = vi.fn(async () => jsonPage([], 1, 1));
+    await listSandboxDNSRecords(
+      { token: 'tok', accountId: 'acct', zoneId: 'zone' },
+      { fetcher }
+    );
+    const [url] = fetcher.mock.calls[0];
+    expect(String(url)).toContain(
+      'https://api.cloudflare.com/client/v4/zones/zone/dns_records'
+    );
+    expect(String(url)).toContain('type=CNAME');
+    expect(String(url)).toContain('comment.startswith=sandbox-');
+    expect(String(url)).toContain('per_page=1000');
+  });
+
+  it('throws when zoneId is not configured on credentials', async () => {
+    const fetcher = vi.fn();
+    await expect(
+      listSandboxDNSRecords({ token: 'tok', accountId: 'acct' }, { fetcher })
+    ).rejects.toThrow(/zoneId/i);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('returns records with parsed createdAt dates', async () => {
+    const fetcher = vi.fn(async () =>
+      jsonPage(
+        [
+          {
+            id: 'rec-1',
+            name: 'api.example.com',
+            type: 'CNAME',
+            content: 'tun-1.cfargotunnel.com',
+            comment: 'sandbox-sb1',
+            created_on: '2026-05-01T00:00:00Z'
+          }
+        ],
+        1,
+        1
+      )
+    );
+    const result = await listSandboxDNSRecords(
+      { token: 'tok', accountId: 'acct', zoneId: 'zone' },
+      { fetcher }
+    );
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe('rec-1');
+    expect(result[0].comment).toBe('sandbox-sb1');
+    expect(result[0].createdAt).toBeInstanceOf(Date);
+    expect(result[0].createdAt.toISOString()).toBe('2026-05-01T00:00:00.000Z');
+  });
+
+  it('filters by comment === `sandbox-<sandboxId>` when opts.sandboxId is set', async () => {
+    const fetcher = vi.fn(async () =>
+      jsonPage(
+        [
+          {
+            id: 'rec-sb1',
+            name: 'a.example.com',
+            type: 'CNAME',
+            content: 'tun-a.cfargotunnel.com',
+            comment: 'sandbox-sb1',
+            created_on: '2026-05-01T00:00:00Z'
+          },
+          {
+            id: 'rec-sb2',
+            name: 'b.example.com',
+            type: 'CNAME',
+            content: 'tun-b.cfargotunnel.com',
+            comment: 'sandbox-sb2',
+            created_on: '2026-05-01T00:00:00Z'
+          }
+        ],
+        1,
+        1
+      )
+    );
+    const result = await listSandboxDNSRecords(
+      { token: 'tok', accountId: 'acct', zoneId: 'zone' },
+      { sandboxId: 'sb1', fetcher }
+    );
+    expect(result.map((r) => r.id)).toEqual(['rec-sb1']);
+  });
+
+  it('walks pagination', async () => {
+    let page = 0;
+    const fetcher = vi.fn(async () => {
+      page += 1;
+      return jsonPage(
+        [
+          {
+            id: `rec-${page}`,
+            name: `h${page}.example.com`,
+            type: 'CNAME',
+            content: `t${page}.cfargotunnel.com`,
+            comment: 'sandbox-sb',
+            created_on: '2026-05-01T00:00:00Z'
+          }
+        ],
+        page,
+        2
+      );
+    });
+    const result = await listSandboxDNSRecords(
+      { token: 'tok', accountId: 'acct', zoneId: 'zone' },
+      { fetcher }
+    );
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(result.map((r) => r.id)).toEqual(['rec-1', 'rec-2']);
   });
 });
