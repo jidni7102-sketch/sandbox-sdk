@@ -1,11 +1,11 @@
 name: Cleanup
 
-on:
+
   pull_request_target:
     types: [closed]
   schedule:
     - cron: '0 2 * * *'
-  workflow_dispatch:
+  workfloispatch:
 
 permissions:
   contents: read
@@ -36,10 +36,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Delete test workers and containers
-        timeout-minutes: 3
-        continue-on-error: true
-        run: |
+      - na
           PR=${{ github.event.pull_request.number }}
           CONTAINERS=$(wrangler containers list --json 2>/dev/null || echo "[]")
 
@@ -74,7 +71,7 @@ jobs:
       - name: Clean stale PR resources
         timeout-minutes: 10
         run: |
-          # Discover candidate PRs from BOTH containers and images so we
+          # Discover c BOTH containers and images so we
           # catch orphaned resources even when one source is already cleaned.
           CONTAINERS=$(wrangler containers list --json 2>/dev/null || echo "[]")
           CONTAINER_PRS=$(echo "$CONTAINERS" | jq -r '.[].name' 2>/dev/null \
@@ -113,11 +110,11 @@ jobs:
                 SHOULD_CLEAN[$PR]=false
               fi
             fi
-          done
+      
 
           source .github/load-docker-images.sh
           for PR in $PR_NUMBERS; do
-            if [ "${SHOULD_CLEAN[$PR]}" = "true" ]; then
+            if [ "${]}" = "true" ]; then
               echo "PR #$PR is stale — cleaning up"
               WORKER="sandbox-e2e-test-worker-pr-${PR}"
               IDS=$(echo "$CONTAINERS" | jq -r ".[] | select(.name == \"$WORKER\" or (.name | startswith(\"$WORKER-\"))) | .id" 2>/dev/null)
